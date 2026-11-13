@@ -127,3 +127,4 @@ Useful scripts in `backend/`:
 - SLA targets are computed in calendar hours; business-hours schedules are stored and shown but not yet used to pause the SLA clock.
 - Email sending is not wired up; replies and notifications are in-app. The data model (cc/to emails, sources) is ready for an email integration.
 - Uploads are stored in Convex file storage and served by the API at `/uploads/<name>`.
+# nexus-crm-web
