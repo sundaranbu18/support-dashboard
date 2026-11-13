@@ -1,6 +1,6 @@
 import jwt from 'jsonwebtoken';
 import { env } from '../config/env.js';
-import { query } from '../config/db.js';
+import { db } from '../db/index.js';
 import { HttpError } from '../utils/errors.js';
 
 export const ALL_PRIVILEGES = ['reply_ticket', 'delete_ticket', 'merge_split_ticket', 'export_data', 'manage_contacts', 'manage_kb', 'moderate_forums', 'view_reports', 'manage_admin'];
@@ -17,20 +17,13 @@ export function signToken(payload) {
 
 async function loadPrincipal(decoded) {
   if (decoded.kind === 'user') {
-    const { rows } = await query(
-      'SELECT u.id, u.name, u.email, u.role, u.avatar_url, u.is_active, r.privileges FROM users u LEFT JOIN roles r ON r.id = u.role_id WHERE u.id = $1',
-      [decoded.sub]
-    );
-    const u = rows[0];
+    const u = await db.get('users', decoded.sub);
     if (!u || !u.is_active) return null;
-    return { id: u.id, kind: 'user', role: u.role, name: u.name, email: u.email, avatar_url: u.avatar_url, privileges: privilegesFor(u.role, u.privileges) };
+    const role = u.role_id ? await db.get('roles', u.role_id) : null;
+    return { id: u.id, kind: 'user', role: u.role, name: u.name, email: u.email, avatar_url: u.avatar_url, privileges: privilegesFor(u.role, role?.privileges ?? null) };
   }
   if (decoded.kind === 'contact') {
-    const { rows } = await query(
-      'SELECT id, name, email, company_id, is_blocked FROM contacts WHERE id = $1',
-      [decoded.sub]
-    );
-    const c = rows[0];
+    const c = await db.get('contacts', decoded.sub);
     if (!c || c.is_blocked) return null;
     return { id: c.id, kind: 'contact', role: 'customer', name: c.name, email: c.email, company_id: c.company_id };
   }

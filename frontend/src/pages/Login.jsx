@@ -23,15 +23,11 @@ export default function Login() {
       navigate(u.kind === 'user' ? '/dashboard' : '/portal');
     } catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }
   };
-  const fill = (e, p) => { setEmail(e); setPassword(p); };
 
   return (
     <div className="auth-page">
       <div className="auth-hero">
-        <div className="row" style={{ gap: 12 }}>
-          <img src="/brand/wadhwani-logo.png" alt="Wadhwani Foundation" style={{ height: 72, width: 'auto' }} />
-          <span style={{ fontSize: 22, fontWeight: 600 }}>Support</span>
-        </div>
+        <div className="brand-wordmark" style={{ fontSize: 34 }}>Nexus</div>
         <h1>Every conversation, one inbox.</h1>
         <p>A complete help desk with ticketing, SLAs, automations, knowledge base, customer portal and reporting.</p>
         <ul>
@@ -50,12 +46,6 @@ export default function Login() {
           <Field label="Email"><input className="input" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoFocus /></Field>
           <Field label="Password"><input className="input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required /></Field>
           <button className="btn btn-primary" disabled={busy} style={{ padding: 11 }}>{busy ? 'Signing in…' : 'Sign in'}</button>
-          <div className="demo-creds">
-            <strong>Demo accounts (password: password123)</strong>
-            <button type="button" onClick={() => fill('admin@supportdesk.local', 'password123')}>admin@supportdesk.local — Admin</button>
-            <button type="button" onClick={() => fill('priya@supportdesk.local', 'password123')}>priya@supportdesk.local — Agent</button>
-            <button type="button" onClick={() => fill('customer@acme.com', 'password123')}>customer@acme.com — Customer portal</button>
-          </div>
           <p className="muted center small">New customer? <Link to="/register">Create a portal account</Link> · <Link to="/portal">Browse help center</Link></p>
         </form>
       </div>

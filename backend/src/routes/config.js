@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import crypto from 'node:crypto';
-import { query } from '../config/db.js';
+import { db, indexBy, nowIso } from '../db/index.js';
 import { authenticate, requireAgent, requireAdmin, optionalAuth, ALL_PRIVILEGES } from '../middleware/auth.js';
 import { asyncHandler, badRequest, notFound } from '../utils/errors.js';
 import { crudRouter } from '../utils/crud.js';
@@ -8,19 +8,21 @@ import { slugify, toArray } from '../utils/helpers.js';
 import { refreshStatuses } from '../utils/statuses.js';
 
 const router = Router();
+// Projects a row to the columns the old SELECT listed (null kept, unlike helpers.pick).
+const pick = (row, cols) => Object.fromEntries(cols.map((k) => [k, row[k] ?? null]));
 
 // Portal pages need these without an agent login.
 router.get('/ticket-statuses/public', asyncHandler(async (_req, res) => {
-  const { rows } = await query('SELECT key, label, customer_label, stops_sla, is_default FROM ticket_statuses ORDER BY position, key');
-  res.json({ data: rows });
+  const rows = await db.find('ticket_statuses', null, { order: [['position', 'asc'], ['key', 'asc']] });
+  res.json({ data: rows.map((r) => pick(r, ['key', 'label', 'customer_label', 'stops_sla', 'is_default'])) });
 }));
 router.get('/ticket-forms/public', optionalAuth, asyncHandler(async (_req, res) => {
-  const { rows } = await query('SELECT id, name, description, type, product_id, group_id, field_names FROM ticket_forms WHERE is_active = TRUE ORDER BY position, id');
-  res.json({ data: rows });
+  const rows = await db.find('ticket_forms', { is_active: true }, { order: [['position', 'asc'], ['id', 'asc']] });
+  res.json({ data: rows.map((r) => pick(r, ['id', 'name', 'description', 'type', 'product_id', 'group_id', 'field_names'])) });
 }));
 router.get('/surveys/active', asyncHandler(async (_req, res) => {
-  const { rows } = await query('SELECT id, name, question, labels FROM surveys WHERE is_active = TRUE ORDER BY id LIMIT 1');
-  res.json({ data: rows[0] || null });
+  const row = await db.findOne('surveys', { is_active: true }, { order: [['id', 'asc']] });
+  res.json({ data: row ? pick(row, ['id', 'name', 'question', 'labels']) : null });
 }));
 
 router.use(authenticate, requireAgent);
@@ -33,10 +35,9 @@ router.use('/ticket-statuses', crudRouter({
     if (b.label && !b.customer_label) b.customer_label = b.label;
   },
   canDelete: async (key) => {
-    const { rows: [s] } = await query('SELECT is_default FROM ticket_statuses WHERE key = $1', [key]);
+    const [s, used] = await Promise.all([db.findOne('ticket_statuses', { key }), db.count('tickets', { status: key })]);
     if (s?.is_default) throw badRequest('Built-in statuses cannot be deleted');
-    const { rows: [used] } = await query('SELECT COUNT(*) FROM tickets WHERE status = $1', [key]);
-    if (Number(used.count)) throw badRequest(`${used.count} ticket(s) still use this status`);
+    if (Number(used)) throw badRequest(`${used} ticket(s) still use this status`);
   },
   afterChange: refreshStatuses,
 }));
@@ -53,22 +54,22 @@ router.use('/ticket-forms', crudRouter({
   beforeSave: (b) => { if (b.field_names !== undefined) b.field_names = toArray(b.field_names); },
 }));
 router.use('/entity-fields', crudRouter({
-  table: 'entity_fields', orderBy: 'entity, position, id', label: 'Field', required: ['entity', 'label'], json: ['options'],
+  table: 'entity_fields', orderBy: 'entity, position, id', label: 'Field', required: ['entity', 'label'],
   fields: ['entity', 'name', 'label', 'field_type', 'options', 'position'],
   beforeSave: (b) => { if (b.label && !b.name) b.name = slugify(b.label).replace(/-/g, '_'); },
 }));
 router.use('/surveys', crudRouter({
-  table: 'surveys', orderBy: 'id', label: 'Survey', required: ['name'], json: ['labels'], fields: ['name', 'question', 'labels', 'is_active'],
+  table: 'surveys', orderBy: 'id', label: 'Survey', required: ['name'], fields: ['name', 'question', 'labels', 'is_active'],
   beforeSave: (b) => { if (b.labels !== undefined && (!Array.isArray(b.labels) || b.labels.length < 2 || b.labels.length > 7)) throw badRequest('A survey needs 2 to 7 answer labels'); },
   // Only one survey can be sent at a time.
-  afterChange: async (row) => { if (row?.is_active) await query('UPDATE surveys SET is_active = FALSE WHERE id <> $1', [row.id]); },
+  afterChange: async (row) => { if (row?.is_active) await db.updateWhere('surveys', { id: { ne: row.id }, is_active: true }, { is_active: false }); },
 }));
 router.use('/mailboxes', crudRouter({ table: 'mailboxes', fields: ['name', 'email', 'group_id', 'product_id', 'is_default'], required: ['name', 'email'], orderBy: 'name', label: 'Mailbox' }));
 router.use('/email-notifications', crudRouter({ table: 'email_notifications', idColumn: 'key', fields: ['is_enabled', 'subject', 'body'], orderBy: 'audience DESC, key', label: 'Notification' }));
 
 // ---------------- roles
 const syncRoleUsers = async (role) => {
-  if (role) await query('UPDATE users SET role = $1 WHERE role_id = $2', [role.privileges.includes('manage_admin') ? 'admin' : 'agent', role.id]);
+  if (role) await db.updateWhere('users', { role_id: role.id }, { role: role.privileges.includes('manage_admin') ? 'admin' : 'agent' });
 };
 router.use('/roles', crudRouter({
   table: 'roles', orderBy: 'id', label: 'Role', required: ['name'], fields: ['name', 'description', 'privileges'],
@@ -77,77 +78,79 @@ router.use('/roles', crudRouter({
       b.privileges = toArray(b.privileges).filter((p) => ALL_PRIVILEGES.includes(p));
     }
     if (req.params.id) {
-      const { rows: [role] } = await query('SELECT is_default FROM roles WHERE id = $1', [req.params.id]);
+      const [role] = await db.find('roles', { id: req.params.id }, { select: ['is_default'] });
       if (role?.is_default) throw badRequest('Built-in roles cannot be changed. Create a new role instead.');
     }
   },
   canDelete: async (id) => {
-    const { rows: [role] } = await query('SELECT is_default, (SELECT COUNT(*) FROM users WHERE role_id = $1) AS users FROM roles WHERE id = $1', [id]);
+    const { roles: [role], users } = await db.fetch({ roles: ['roles', { id }], users: ['users', { role_id: id }, { select: ['id'] }] });
     if (role?.is_default) throw badRequest('Built-in roles cannot be deleted');
-    if (Number(role?.users)) throw badRequest('Move the agents off this role first');
+    if (role && users.length) throw badRequest('Move the agents off this role first');
   },
   afterChange: syncRoleUsers,
 }));
 
 // ---------------- scenarios: visible by scope, written by admins
 router.get('/scenarios', asyncHandler(async (req, res) => {
-  const { rows } = await query(
-    `SELECT s.*, u.name AS owner_name, g.name AS group_name FROM scenarios s LEFT JOIN users u ON u.id = s.user_id LEFT JOIN groups g ON g.id = s.group_id
-      WHERE s.visibility = 'all' OR s.user_id = $1 OR $2 = 'admin'
-         OR (s.visibility = 'group' AND s.group_id IN (SELECT group_id FROM group_members WHERE user_id = $1))
-      ORDER BY s.name`, [req.user.id, req.user.role]
-  );
-  res.json({ data: rows });
+  const { scenarios, users, groups, gm } = await db.fetch({
+    scenarios: ['scenarios', null, { order: [['name', 'asc']] }],
+    users: ['users', null, { select: ['id', 'name'] }],
+    groups: ['groups', null, { select: ['id', 'name'] }],
+    gm: ['group_members', { user_id: req.user.id }, { select: ['group_id'] }],
+  });
+  const usersById = indexBy(users);
+  const groupsById = indexBy(groups);
+  const myGroups = new Set(gm.map((m) => m.group_id));
+  const data = scenarios
+    .filter((s) => s.visibility === 'all' || s.user_id === req.user.id || req.user.role === 'admin'
+      || (s.visibility === 'group' && myGroups.has(s.group_id)))
+    .map((s) => ({ ...s, owner_name: usersById.get(s.user_id)?.name ?? null, group_name: groupsById.get(s.group_id)?.name ?? null }));
+  res.json({ data });
 }));
 router.post('/scenarios', requireAdmin, asyncHandler(async (req, res) => {
   const b = req.body;
   if (!b.name) throw badRequest('name is required');
-  const { rows } = await query(
-    `INSERT INTO scenarios (name, description, visibility, group_id, user_id, actions) VALUES ($1,$2,COALESCE($3,'all'),$4,$5,$6) RETURNING *`,
-    [b.name, b.description || null, b.visibility || null, b.group_id || null, req.user.id, JSON.stringify(b.actions || [])]
-  );
-  res.status(201).json({ data: rows[0] });
+  const row = await db.insert('scenarios', {
+    name: b.name, description: b.description || null, visibility: b.visibility || 'all', group_id: b.group_id || null,
+    user_id: req.user.id, actions: b.actions || [],
+  });
+  res.status(201).json({ data: row });
 }));
 router.put('/scenarios/:id', requireAdmin, asyncHandler(async (req, res) => {
   const b = req.body;
-  const { rows } = await query(
-    `UPDATE scenarios SET name = COALESCE($2,name), description = $3, visibility = COALESCE($4,visibility), group_id = $5, actions = COALESCE($6,actions) WHERE id = $1 RETURNING *`,
-    [req.params.id, b.name || null, b.description || null, b.visibility || null, b.group_id || null, b.actions ? JSON.stringify(b.actions) : null]
-  );
-  if (!rows[0]) throw notFound('Scenario');
-  res.json({ data: rows[0] });
+  const patch = { description: b.description || null, group_id: b.group_id || null };
+  if (b.name) patch.name = b.name;
+  if (b.visibility) patch.visibility = b.visibility;
+  if (b.actions) patch.actions = b.actions;
+  const [row] = await db.updateWhere('scenarios', { id: req.params.id }, patch);
+  if (!row) throw notFound('Scenario');
+  res.json({ data: row });
 }));
 router.delete('/scenarios/:id', requireAdmin, asyncHandler(async (req, res) => {
-  const { rowCount } = await query('DELETE FROM scenarios WHERE id = $1', [req.params.id]);
-  if (!rowCount) throw notFound('Scenario');
+  const removed = await db.removeWhere('scenarios', { id: req.params.id });
+  if (!removed) throw notFound('Scenario');
   res.json({ ok: true });
 }));
 
 // ---------------- channels: token for the inbound webhook, shown to admins only
 router.get('/channels/token', requireAdmin, asyncHandler(async (_req, res) => {
-  const { rows } = await query("SELECT value FROM settings WHERE key = 'inbound'");
-  res.json({ data: { token: rows[0]?.value?.token || null } });
+  const row = await db.findOne('settings', { key: 'inbound' });
+  res.json({ data: { token: row?.value?.token || null } });
 }));
 router.post('/channels/token', requireAdmin, asyncHandler(async (_req, res) => {
   const token = crypto.randomBytes(24).toString('hex');
-  await query(
-    `INSERT INTO settings (key, value, updated_at) VALUES ('inbound', $1, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-    [JSON.stringify({ token })]
-  );
+  const updatedAt = nowIso();
+  await db.upsert('settings', { key: 'inbound' }, { key: 'inbound', value: { token }, updated_at: updatedAt }, { value: { token }, updated_at: updatedAt });
   res.json({ data: { token } });
 }));
 
 // ---------------- operations
 router.get('/audit-log', requireAdmin, asyncHandler(async (_req, res) => {
-  const { rows } = await query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200');
-  res.json({ data: rows });
+  res.json({ data: await db.find('audit_log', null, { order: [['created_at', 'desc']], limit: 200 }) });
 }));
 router.get('/outbox', asyncHandler(async (req, res) => {
-  const params = [];
-  let where = '';
-  if (req.query.status) { params.push(req.query.status); where = 'WHERE status = $1'; }
-  const { rows } = await query(`SELECT * FROM email_outbox ${where} ORDER BY created_at DESC LIMIT 200`, params);
-  res.json({ data: rows });
+  const where = req.query.status ? { status: req.query.status } : null;
+  res.json({ data: await db.find('email_outbox', where, { order: [['created_at', 'desc']], limit: 200 }) });
 }));
 
 export default router;

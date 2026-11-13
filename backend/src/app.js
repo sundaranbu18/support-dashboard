@@ -1,9 +1,12 @@
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
 import { env } from './config/env.js';
 import { errorHandler } from './utils/errors.js';
-import { UPLOAD_DIR } from './utils/upload.js';
+import { serveUpload } from './utils/upload.js';
 
 import authRoutes from './routes/auth.js';
 import userRoutes from './routes/users.js';
@@ -25,7 +28,7 @@ import ticketExtraRoutes from './routes/ticketExtras.js';
 import forumRoutes from './routes/forums.js';
 import analyticsRoutes from './routes/analytics.js';
 import inboundRoutes from './routes/inbound.js';
-import { query as dbQuery } from './config/db.js';
+import { db } from './db/index.js';
 
 const app = express();
 
@@ -34,12 +37,11 @@ app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 if (process.env.NODE_ENV !== 'test') app.use(morgan('dev'));
 
-app.use('/uploads', express.static(UPLOAD_DIR));
+app.get('/uploads/:name', serveUpload);
 
 app.get('/api/health', async (_req, res) => {
-  const { query } = await import('./config/db.js');
   try {
-    await query('SELECT 1');
+    await db.ping();
     res.json({ status: 'ok', database: 'connected', time: new Date().toISOString() });
   } catch (err) {
     res.status(500).json({ status: 'error', database: 'unreachable', error: err.message });
@@ -52,7 +54,7 @@ app.use((req, res, next) => {
   if (req.method !== 'GET' && AUDITED.test(req.path)) {
     res.on('finish', () => {
       if (res.statusCode < 400 && req.user?.kind === 'user') {
-        dbQuery('INSERT INTO audit_log (user_id, actor_label, method, path, status) VALUES ($1,$2,$3,$4,$5)', [req.user.id, req.user.name, req.method, req.path, res.statusCode]).catch((err) => console.error('[audit]', err.message));
+        db.insert('audit_log', { user_id: req.user.id, actor_label: req.user.name, method: req.method, path: req.path, status: res.statusCode }).catch((err) => console.error('[audit]', err.message));
       }
     });
   }
@@ -82,6 +84,15 @@ app.use('/api/forums', forumRoutes);
 app.use('/api/analytics', analyticsRoutes);
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Route not found' }));
+
+// Single service: the built React app (frontend/dist) is served from the same origin as the API.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CLIENT_DIST = process.env.CLIENT_DIST || path.resolve(__dirname, '../../frontend/dist');
+if (fs.existsSync(path.join(CLIENT_DIST, 'index.html'))) {
+  app.use(express.static(CLIENT_DIST, { index: false, maxAge: '1h' }));
+  app.get('*', (_req, res) => res.sendFile(path.join(CLIENT_DIST, 'index.html')));
+}
+
 app.use(errorHandler);
 
 export default app;

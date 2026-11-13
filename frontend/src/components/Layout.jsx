@@ -119,8 +119,8 @@ export default function Layout() {
     <div className="app-shell">
       <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
         <div className="sidebar-brand">
-          <img className="brand-logo" src="/brand/wadhwani-logo.png" alt="Wadhwani Foundation" />
-          <img className="brand-mark" src="/brand/wadhwani-mark.png" alt="Wadhwani Foundation" />
+          <span className="brand-logo brand-wordmark">Nexus</span>
+          <span className="brand-mark brand-wordmark" aria-label="Nexus">N</span>
         </div>
         <nav className="sidebar-nav">
           {nav.map((n) => (

@@ -1,8 +1,8 @@
 import { Router } from 'express';
-import { query } from '../config/db.js';
+import { db } from '../db/index.js';
 import { authenticate, requireAgent, requireAdmin } from '../middleware/auth.js';
 import { asyncHandler, notFound, badRequest } from '../utils/errors.js';
-import { requireFields, buildUpdate } from '../utils/helpers.js';
+import { requireFields, pick } from '../utils/helpers.js';
 import { runTimeTriggers, runAutomations } from '../utils/automations.js';
 
 const router = Router();
@@ -52,11 +52,12 @@ export const AUTOMATION_META = {
 
 router.get('/meta', (_req, res) => res.json({ data: AUTOMATION_META }));
 
+// WHERE id = $1 lookup; a missing id matches nothing (as `id = NULL` did).
+const byId = (table, id) => (id === undefined || id === null ? null : db.findOne(table, { id }));
+
 router.get('/', asyncHandler(async (req, res) => {
-  const params = [];
-  let where = '';
-  if (req.query.event) { params.push(req.query.event); where = 'WHERE event = $1'; }
-  const { rows } = await query(`SELECT * FROM automations ${where} ORDER BY event, position, id`, params);
+  const where = req.query.event ? { event: req.query.event } : null;
+  const rows = await db.find('automations', where, { order: [['event', 'asc'], ['position', 'asc'], ['id', 'asc']] });
   res.json({ data: rows });
 }));
 
@@ -64,29 +65,34 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
   const b = req.body;
   requireFields(b, ['name', 'event']);
   if (!AUTOMATION_META.events.includes(b.event)) throw badRequest('Invalid event');
-  const { rows } = await query(
-    `INSERT INTO automations (name, description, event, conditions, actions, is_active, position)
-     VALUES ($1, $2, $3, $4, $5, COALESCE($6, TRUE), COALESCE($7, (SELECT COALESCE(MAX(position),0)+1 FROM automations WHERE event = $3))) RETURNING *`,
-    [b.name, b.description || null, b.event, JSON.stringify(b.conditions || { match: 'all', rules: [] }), JSON.stringify(b.actions || []), b.is_active, b.position || null]
-  );
-  res.status(201).json({ data: rows[0] });
+  let position = b.position || null;
+  if (position === null) {
+    const siblings = await db.find('automations', { event: b.event });
+    position = siblings.reduce((max, r) => Math.max(max, r.position ?? 0), 0) + 1;
+  }
+  const row = await db.insert('automations', {
+    name: b.name,
+    description: b.description || null,
+    event: b.event,
+    conditions: b.conditions || { match: 'all', rules: [] },
+    actions: b.actions || [],
+    is_active: b.is_active ?? true,
+    position,
+  });
+  res.status(201).json({ data: row });
 }));
 
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
-  const b = { ...req.body };
-  if (b.conditions !== undefined) b.conditions = JSON.stringify(b.conditions);
-  if (b.actions !== undefined) b.actions = JSON.stringify(b.actions);
-  const { sets, values } = buildUpdate(b, ['name', 'description', 'event', 'conditions', 'actions', 'is_active', 'position']);
-  if (!sets.length) throw badRequest('Nothing to update');
-  values.push(req.params.id);
-  const { rows } = await query(`UPDATE automations SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`, values);
-  if (!rows[0]) throw notFound('Automation');
-  res.json({ data: rows[0] });
+  const patch = pick(req.body, ['name', 'description', 'event', 'conditions', 'actions', 'is_active', 'position']);
+  if (!Object.keys(patch).length) throw badRequest('Nothing to update');
+  const [row] = await db.updateWhere('automations', { id: req.params.id }, patch);
+  if (!row) throw notFound('Automation');
+  res.json({ data: row });
 }));
 
 router.post('/reorder', requireAdmin, asyncHandler(async (req, res) => {
   const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
-  for (let i = 0; i < ids.length; i++) await query('UPDATE automations SET position = $1 WHERE id = $2', [i + 1, ids[i]]);
+  if (ids.length) await db.batch(ids.map((id, i) => ({ op: 'update', table: 'automations', where: { id }, patch: { position: i + 1 } })));
   res.json({ ok: true });
 }));
 
@@ -98,19 +104,19 @@ router.post('/run-time-triggers', requireAdmin, asyncHandler(async (_req, res) =
 
 // Dry-run a single rule's conditions against a ticket.
 router.post('/:id/test', asyncHandler(async (req, res) => {
-  const { rows } = await query('SELECT * FROM automations WHERE id = $1', [req.params.id]);
-  if (!rows[0]) throw notFound('Automation');
-  const { rows: tickets } = await query('SELECT * FROM tickets WHERE id = $1', [req.body.ticket_id]);
-  if (!tickets[0]) throw badRequest('ticket_id required');
+  const rule = await byId('automations', req.params.id);
+  if (!rule) throw notFound('Automation');
+  const ticket = await byId('tickets', req.body.ticket_id);
+  if (!ticket) throw badRequest('ticket_id required');
   const { evaluateConditions } = await import('../utils/automations.js');
   // Light context without side effects.
-  const matched = evaluateConditions(rows[0].conditions, tickets[0]);
+  const matched = evaluateConditions(rule.conditions, ticket);
   res.json({ data: { matched } });
 }));
 
 router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
-  const { rowCount } = await query('DELETE FROM automations WHERE id = $1', [req.params.id]);
-  if (!rowCount) throw notFound('Automation');
+  const removed = await db.removeWhere('automations', { id: req.params.id });
+  if (!removed) throw notFound('Automation');
   res.json({ ok: true });
 }));
 

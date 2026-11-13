@@ -1,31 +1,60 @@
-# Wadhwani Support
+# Nexus
 
-A full-featured help desk (Freshdesk-style) built with **React**, **Node.js/Express** and **PostgreSQL**.
+A full-featured help desk (Freshdesk-style) built with **React**, **Node.js/Express** and **Convex** (database + file storage).
+
+It deploys as **one service**: the Express server serves both the REST API (`/api`) and the built React app on the same port.
 
 ```
 support-application/
-├── backend/    Node.js + Express REST API, Postgres schema, seed data
+├── Dockerfile  Builds the single deployable service (React build + API)
+├── backend/    Node.js + Express REST API, Convex schema/functions (backend/convex), seed data
 └── frontend/   React (Vite) agent dashboard + customer portal
 ```
 
+## Data: Convex
+
+All tables live in the Convex **Nexus** project (team `rakeshwfg`, deployment `curious-ram-94`).
+
+- `backend/convex/tables.js` – table/column metadata (generated from the legacy Postgres schema; source of truth now)
+- `backend/convex/schema.js` – Convex schema + indexes built from that metadata
+- `backend/convex/db.js` – generic data functions (unique constraints, cascading deletes, numeric ids) called only by the API server
+- `backend/convex/files.js` – attachments and images in Convex file storage (served at `/uploads/<name>`)
+- `backend/src/db/index.js` – the data API used by every route
+
+The Convex functions require a shared secret (`NEXUS_SERVER_SECRET`) that is set both on the Convex deployment and in the server's environment, so they cannot be called from a browser.
+
 ## Quick start
 
-Prerequisites: Node 18+, PostgreSQL running locally (defaults: 127.0.0.1:5432, user `postgres`, password `1234`).
+Prerequisites: Node 18+ and access to the Convex Nexus project (`npx convex login`).
 
 ```bash
-# 1. Backend – creates the `supportdesk` database, applies the schema, seeds demo data
-cd backend
-npm install
-npm run db:reset
-npm run dev          # API on http://localhost:4000
+npm run install:all
+cp backend/.env.example backend/.env   # set NEXUS_SERVER_SECRET (same value as on the Convex deployment)
 
-# 2. Frontend (in a second terminal)
-cd frontend
-npm install
-npm run dev          # App on http://localhost:5173
+# Push schema + functions to the Nexus deployment (backend/.env.local pins CONVEX_DEPLOYMENT=dev:curious-ram-94)
+npm run convex:push
+
+# Optional: demo data (only if Convex is empty) – or `npm run db:reset` to wipe and reseed
+npm run db:seed
+
+# Single service: build the React app, then serve app + API on http://localhost:4000
+npm run build
+npm start
 ```
 
-Open http://localhost:5173 and sign in.
+For development with hot reload run `npm run dev:backend` and `npm run dev:frontend` (Vite on http://localhost:5173 proxies `/api` and `/uploads` to the API).
+
+### Deploying
+
+Deploy one service from the repo root – either the `Dockerfile`, or a Node host with build command `npm run build` and start command `npm start`. Set these environment variables: `CONVEX_URL`, `NEXUS_SERVER_SECRET`, `JWT_SECRET` (and optionally `PORT`, SMTP settings). Run `npm run convex:push` whenever `backend/convex/` changes.
+
+### Migrating existing Postgres data
+
+`backend/scripts/import-from-postgres.js` copies every table (keeping ids) and `backend/uploads/` files into Convex:
+
+```bash
+cd backend && PG_URL=postgres://postgres:1234@127.0.0.1:5432/supportdesk node scripts/import-from-postgres.js --wipe
+```
 
 ### Demo accounts (password: `password123`)
 
@@ -34,8 +63,6 @@ Open http://localhost:5173 and sign in.
 | Admin agent         | admin@supportdesk.local  |
 | Agent               | priya@supportdesk.local  |
 | Customer (portal)   | customer@acme.com        |
-
-Database connection settings live in `backend/.env`. The app creates and uses its own `supportdesk` database on your Postgres server; the `postgres` maintenance database is only used to create it.
 
 See [docs/FEATURE_PARITY.md](docs/FEATURE_PARITY.md) for the full feature checklist and what still needs an outside provider.
 
@@ -90,14 +117,13 @@ Useful scripts in `backend/`:
 
 | Script              | What it does                                   |
 | ------------------- | ---------------------------------------------- |
-| `npm run db:setup`  | Create the database if it does not exist       |
-| `npm run db:migrate`| Apply `src/db/schema.sql` (`--fresh` to wipe)  |
-| `npm run db:seed`   | Load demo agents, contacts, tickets, KB, rules |
-| `npm run db:reset`  | setup + fresh migrate + seed                   |
+| `npm run convex:push` | Push `convex/` schema + functions to the Nexus deployment |
+| `npm run db:seed`   | Load demo agents, contacts, tickets, KB, rules (skips if data exists) |
+| `npm run db:reset`  | Wipe all Convex tables + files, then seed      |
 | `npm run dev`       | Start the API with auto-reload                 |
 
 ## Notes
 
 - SLA targets are computed in calendar hours; business-hours schedules are stored and shown but not yet used to pause the SLA clock.
 - Email sending is not wired up; replies and notifications are in-app. The data model (cc/to emails, sources) is ready for an email integration.
-- Uploads are stored on disk in `backend/uploads/`.
+- Uploads are stored in Convex file storage and served by the API at `/uploads/<name>`.

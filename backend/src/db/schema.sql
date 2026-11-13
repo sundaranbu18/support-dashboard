@@ -1,4 +1,5 @@
--- SupportDesk schema -------------------------------------------------------
+-- LEGACY Postgres schema, kept for historical reference only: convex/tables.js is now generated from it and is the source of truth.
+-- Nexus schema -------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,

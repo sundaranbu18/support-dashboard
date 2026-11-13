@@ -1,4 +1,4 @@
-import { query } from '../config/db.js';
+import { db } from '../db/index.js';
 
 let transportPromise;
 async function transport() {
@@ -29,11 +29,7 @@ export async function sendEmail({ to, subject, body, ticketId = null }) {
       error = err.message;
     }
   }
-  const { rows } = await query(
-    'INSERT INTO email_outbox (ticket_id, to_email, subject, body, status, error) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-    [ticketId, to, subject, body, status, error]
-  );
-  return rows[0];
+  return db.insert('email_outbox', { ticket_id: ticketId, to_email: to, subject, body, status, error });
 }
 
 export function renderTemplate(text, vars) {
@@ -43,14 +39,11 @@ export function renderTemplate(text, vars) {
 // Sends one configured notification. Mail problems must never fail the ticket action.
 export async function sendTicketEmail(key, ticket, extra = {}) {
   try {
-    const { rows: [tpl] } = await query('SELECT * FROM email_notifications WHERE key = $1 AND is_enabled = TRUE', [key]);
+    const tpl = await db.findOne('email_notifications', { key, is_enabled: true });
     if (!tpl) return;
-    const { rows: [people] } = await query(
-      `SELECT c.name AS requester_name, c.email AS requester_email, u.name AS agent_name, u.email AS agent_email
-         FROM contacts c LEFT JOIN users u ON u.id = $2 WHERE c.id = $1`,
-      [ticket.requester_id, ticket.responder_id]
-    );
-    if (!people) return;
+    const [contact, agent] = await Promise.all([db.get('contacts', ticket.requester_id), ticket.responder_id ? db.get('users', ticket.responder_id) : null]);
+    if (!contact) return;
+    const people = { requester_name: contact.name, requester_email: contact.email, agent_name: agent?.name ?? null, agent_email: agent?.email ?? null };
     const to = tpl.audience === 'requester' ? people.requester_email : people.agent_email;
     const vars = {
       'ticket.id': ticket.id, 'ticket.subject': ticket.subject, 'ticket.status': ticket.status, 'ticket.priority': ticket.priority,

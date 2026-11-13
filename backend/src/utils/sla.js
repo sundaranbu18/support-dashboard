@@ -1,4 +1,4 @@
-import { query } from '../config/db.js';
+import { db } from '../db/index.js';
 
 // Statuses configured to stop the SLA clock; kept current by refreshStatuses().
 let pausedStatuses = new Set(['pending']);
@@ -18,9 +18,7 @@ function matchesList(list, value) {
 
 // Picks the first active, non-default policy whose conditions match; otherwise the default.
 export async function pickSlaPolicy(ticket) {
-  const { rows } = await query(
-    'SELECT * FROM sla_policies WHERE is_active = TRUE ORDER BY is_default ASC, position ASC, id ASC'
-  );
+  const rows = await db.find('sla_policies', { is_active: true }, { order: [['is_default', 'asc'], ['position', 'asc'], ['id', 'asc']] });
   let fallback = null;
   for (const p of rows) {
     if (p.is_default) { fallback = fallback || p; continue; }

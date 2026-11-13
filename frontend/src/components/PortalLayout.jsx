@@ -15,7 +15,7 @@ export default function PortalLayout() {
     <div className="portal-shell">
       <nav className="portal-nav">
         <div className="inner">
-          <Link to="/portal" className="brand"><img className="brand-logo" src="/brand/wadhwani-logo.png" alt="Wadhwani Foundation" /> {brand}</Link>
+          <Link to="/portal" className="brand">{brand}</Link>
           <div className="links">
             <NavLink to="/portal" end><BookOpen size={15} style={{ verticalAlign: -2, marginRight: 6 }} />Knowledge base</NavLink>
             <NavLink to="/portal/community"><MessagesSquare size={15} style={{ verticalAlign: -2, marginRight: 6 }} />Community</NavLink>

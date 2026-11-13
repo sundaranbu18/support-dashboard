@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import crypto from 'node:crypto';
-import { query } from '../config/db.js';
+import { db, nowIso } from '../db/index.js';
 import { asyncHandler, HttpError, badRequest } from '../utils/errors.js';
 import { requireFields } from '../utils/helpers.js';
 import { applySla } from '../utils/sla.js';
@@ -14,25 +14,26 @@ const SOURCE_BY_CHANNEL = { email: 'email', whatsapp: 'social', facebook: 'socia
 
 async function findOrCreateContact({ email, name, phone }) {
   const lower = email ? String(email).toLowerCase() : null;
-  const { rows } = lower
-    ? await query('SELECT * FROM contacts WHERE LOWER(email) = $1', [lower])
-    : await query('SELECT * FROM contacts WHERE phone = $1 OR mobile = $1', [phone]);
-  if (rows[0]) return rows[0];
-  const { rows: company } = lower ? await query('SELECT id FROM companies WHERE $1 = ANY(domains) LIMIT 1', [lower.split('@')[1]]) : { rows: [] };
-  const { rows: created } = await query(
-    'INSERT INTO contacts (name, email, phone, company_id) VALUES ($1,$2,$3,$4) RETURNING *',
-    [name || (lower ? lower.split('@')[0] : phone), lower, phone || null, company[0]?.id || null]
-  );
-  return created[0];
+  const domain = lower ? lower.split('@')[1] : null;
+  const contactWhere = lower
+    ? { email: { ieq: lower } }
+    : phone != null ? { or: [{ phone }, { mobile: phone }] } : null;
+  const found = await db.fetch({
+    ...(contactWhere ? { contacts: ['contacts', contactWhere, { order: [['id', 'asc']], limit: 1 }] } : {}),
+    ...(domain ? { companies: ['companies', { domains: { contains: domain } }, { order: [['id', 'asc']], limit: 1, select: ['id'] }] } : {}),
+  });
+  if (found.contacts?.[0]) return found.contacts[0];
+  return db.insert('contacts', {
+    name: name || (lower ? lower.split('@')[0] : phone), email: lower, phone: phone || null, company_id: found.companies?.[0]?.id || null,
+  });
 }
 
 async function createTicket({ contact, subject, description, source, group_id = null, product_id = null }) {
   const sla = await applySla({ priority: 'low', type: null, source, group_id, company_id: contact.company_id, created_at: new Date() });
-  const { rows: [created] } = await query(
-    `INSERT INTO tickets (subject, description, source, requester_id, company_id, group_id, product_id, sla_policy_id, fr_due_by, due_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-    [subject, description || '', source, contact.id, contact.company_id, group_id, product_id, sla.sla_policy_id, sla.fr_due_by, sla.due_by]
-  );
+  const created = await db.insert('tickets', {
+    subject, description: description || '', source, requester_id: contact.id, company_id: contact.company_id, group_id, product_id,
+    sla_policy_id: sla.sla_policy_id, fr_due_by: sla.fr_due_by, due_by: sla.due_by,
+  });
   await logActivity(created.id, { kind: 'contact', id: contact.id, name: contact.name }, 'created', { priority: 'low', source });
   const ticket = await runAutomations('ticket_created', created);
   await sendTicketEmail('new_ticket_requester', ticket);
@@ -49,8 +50,8 @@ function tokensMatch(given, expected) {
 router.post('/inbound/:channel', asyncHandler(async (req, res) => {
   const source = SOURCE_BY_CHANNEL[req.params.channel];
   if (!source) throw badRequest('Unknown channel');
-  const { rows } = await query("SELECT value FROM settings WHERE key = 'inbound'");
-  if (!tokensMatch(req.headers['x-inbound-token'], rows[0]?.value?.token)) throw new HttpError(401, 'Invalid inbound token');
+  const inbound = await db.findOne('settings', { key: 'inbound' });
+  if (!tokensMatch(req.headers['x-inbound-token'], inbound?.value?.token)) throw new HttpError(401, 'Invalid inbound token');
   const { from_email: email, from_name: name, from_phone: phone, subject, body, to } = req.body;
   requireFields(req.body, ['body']);
   if (!email && !phone) throw badRequest('from_email or from_phone is required');
@@ -60,11 +61,15 @@ router.post('/inbound/:channel', asyncHandler(async (req, res) => {
   // "[#123]" in the subject continues an existing ticket from the same requester.
   const ref = /\[#(\d+)\]/.exec(subject || '');
   if (ref) {
-    const { rows: [existing] } = await query('SELECT * FROM tickets WHERE id = $1 AND requester_id = $2 AND deleted = FALSE', [ref[1], contact.id]);
+    const existing = await db.findOne('tickets', { id: ref[1], requester_id: contact.id, deleted: false });
     if (existing) {
-      await query(`INSERT INTO conversations (ticket_id, contact_id, kind, body, source) VALUES ($1,$2,'reply',$3,$4)`, [existing.id, contact.id, body, source]);
-      if (existing.status !== 'open') await query("UPDATE tickets SET status = 'open', resolved_at = NULL, closed_at = NULL WHERE id = $1", [existing.id]);
-      else await query('UPDATE tickets SET updated_at = NOW() WHERE id = $1', [existing.id]);
+      await db.batch([
+        { op: 'insert', table: 'conversations', doc: { ticket_id: existing.id, contact_id: contact.id, kind: 'reply', body, source } },
+        {
+          op: 'update', table: 'tickets', where: { id: existing.id },
+          patch: existing.status !== 'open' ? { status: 'open', resolved_at: null, closed_at: null } : { updated_at: nowIso() },
+        },
+      ]);
       await logActivity(existing.id, { kind: 'contact', id: contact.id, name: contact.name }, 'customer_replied', { source });
       const payload = { type: 'customer_reply', title: `${contact.name} replied on #${existing.id}`, body: existing.subject, link: `/tickets/${existing.id}` };
       if (existing.responder_id) await notifyUser(existing.responder_id, payload); else await notifyGroup(existing.group_id, payload);
@@ -72,7 +77,7 @@ router.post('/inbound/:channel', asyncHandler(async (req, res) => {
       return res.status(201).json({ data: { ticket_id: existing.id, appended: true } });
     }
   }
-  const { rows: [mailbox] } = to ? await query('SELECT group_id, product_id FROM mailboxes WHERE LOWER(email) = LOWER($1)', [to]) : { rows: [] };
+  const mailbox = to ? await db.findOne('mailboxes', { email: { ieq: String(to) } }, { select: ['group_id', 'product_id'] }) : null;
   const ticket = await createTicket({ contact, subject: subject || String(body).slice(0, 80), description: body, source, group_id: mailbox?.group_id, product_id: mailbox?.product_id });
   res.status(201).json({ data: { ticket_id: ticket.id, appended: false } });
 }));

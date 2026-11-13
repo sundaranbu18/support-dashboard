@@ -1,25 +1,20 @@
-import { query } from '../config/db.js';
+import { db } from '../db/index.js';
 
 export async function notifyUser(userId, { type, title, body, link }) {
   if (!userId) return;
-  await query(
-    `INSERT INTO notifications (user_id, type, title, body, link) VALUES ($1, $2, $3, $4, $5)`,
-    [userId, type, title, body || null, link || null]
-  );
+  await db.insert('notifications', { user_id: userId, type, title, body: body || null, link: link || null });
 }
 
 export async function notifyContact(contactId, { type, title, body, link }) {
   if (!contactId) return;
-  await query(
-    `INSERT INTO notifications (contact_id, type, title, body, link) VALUES ($1, $2, $3, $4, $5)`,
-    [contactId, type, title, body || null, link || null]
-  );
+  await db.insert('notifications', { contact_id: contactId, type, title, body: body || null, link: link || null });
 }
 
 export async function notifyGroup(groupId, payload, exceptUserId) {
   if (!groupId) return;
-  const { rows } = await query('SELECT user_id FROM group_members WHERE group_id = $1', [groupId]);
-  for (const r of rows) {
-    if (r.user_id !== exceptUserId) await notifyUser(r.user_id, payload);
-  }
+  const members = await db.find('group_members', { group_id: groupId });
+  const docs = members
+    .filter((r) => r.user_id !== exceptUserId)
+    .map((r) => ({ user_id: r.user_id, type: payload.type, title: payload.title, body: payload.body || null, link: payload.link || null }));
+  await db.insertMany('notifications', docs);
 }

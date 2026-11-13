@@ -43,8 +43,9 @@ pre { white-space: pre-wrap; word-break: break-word; font-family: inherit; margi
 .sidebar { width: 220px; flex-shrink: 0; background: var(--sidebar-bg); color: var(--gray-700); border-right: 1px solid var(--border); display: flex; flex-direction: column; transition: width .15s; }
 .sidebar.collapsed { width: 64px; }
 .sidebar-brand { display: flex; align-items: center; gap: 10px; height: 56px; padding: 0 16px; color: var(--gray-900); font-weight: 600; font-size: 15px; border-bottom: 1px solid var(--border); flex-shrink: 0; white-space: nowrap; overflow: hidden; }
-.brand-logo { height: 40px; width: auto; display: block; flex-shrink: 0; }
-.brand-mark { display: none; width: 40px; height: 40px; flex-shrink: 0; }
+.brand-wordmark { font-weight: 700; font-size: 22px; letter-spacing: -0.02em; color: var(--primary-600); line-height: 1; }
+.brand-logo { display: block; flex-shrink: 0; }
+.brand-mark { display: none; flex-shrink: 0; }
 .sidebar.collapsed .brand-logo { display: none; }
 .sidebar.collapsed .brand-mark { display: block; }
 .sidebar.collapsed .sidebar-brand { padding: 0; justify-content: center; }
@@ -326,10 +327,6 @@ table.table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .auth-hero li { display: flex; gap: 10px; align-items: center; color: var(--gray-700); }
 .auth-form { display: grid; place-items: center; padding: 40px 24px; background: var(--bg); }
 .auth-card { width: 100%; max-width: 400px; background: #fff; border-radius: 16px; padding: 32px; box-shadow: var(--shadow-lg); display: flex; flex-direction: column; gap: 18px; }
-.demo-creds { background: var(--gray-50); border: 1px dashed var(--border); border-radius: 8px; padding: 10px 12px; font-size: 12.5px; color: var(--gray-600); display: flex; flex-direction: column; gap: 4px; }
-.demo-creds button { text-align: left; border: 0; background: none; color: var(--primary-600); cursor: pointer; padding: 0; font-size: 12.5px; }
-.demo-creds button:hover { text-decoration: underline; }
-
 /* ---------- portal */
 .portal-shell { min-height: 100vh; display: flex; flex-direction: column; background: var(--bg); }
 .portal-nav { background: #fff; border-bottom: 1px solid var(--border); }

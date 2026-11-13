@@ -1,13 +1,17 @@
 {
-  "name": "supportdesk",
+  "name": "nexus",
   "version": "1.0.0",
   "private": true,
-  "description": "Freshdesk-style help desk: React frontend, Node.js API, PostgreSQL",
+  "description": "Freshdesk-style help desk: React frontend + Node.js API in one service, data in Convex",
+  "engines": { "node": ">=18" },
   "scripts": {
     "install:all": "npm --prefix backend install && npm --prefix frontend install",
+    "build": "npm --prefix backend install --omit=dev && npm --prefix frontend install --include=dev && npm --prefix frontend run build",
+    "start": "npm --prefix backend start",
+    "convex:push": "npm --prefix backend run convex:push",
+    "db:seed": "npm --prefix backend run db:seed",
     "db:reset": "npm --prefix backend run db:reset",
     "dev:backend": "npm --prefix backend run dev",
-    "dev:frontend": "npm --prefix frontend run dev",
-    "build": "npm --prefix frontend run build"
+    "dev:frontend": "npm --prefix frontend run dev"
   }
 }

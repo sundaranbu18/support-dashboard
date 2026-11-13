@@ -1,13 +1,13 @@
 import { Router } from 'express';
-import { query } from '../config/db.js';
+import { db, nowIso } from '../db/index.js';
 import { authenticate, requireAgent, requireAdmin, optionalAuth } from '../middleware/auth.js';
 import { asyncHandler, notFound, badRequest } from '../utils/errors.js';
-import { requireFields, buildUpdate, slugify } from '../utils/helpers.js';
+import { requireFields, slugify } from '../utils/helpers.js';
 
 const router = Router();
 
 const DEFAULT_SETTINGS = {
-  helpdesk: { name: 'Wadhwani Support', portal_name: 'Help Center', support_email: 'support@supportdesk.local', primary_color: '#BF2026', language: 'en', time_zone: 'UTC', portal_signup_enabled: true },
+  helpdesk: { name: 'Nexus', portal_name: 'Nexus Help Center', support_email: 'support@supportdesk.local', primary_color: '#BF2026', language: 'en', time_zone: 'UTC', portal_signup_enabled: true },
   tickets: { default_priority: 'low', default_status: 'open', auto_close_after_days: 7, archive_after_days: 0, allow_customer_close: true, csat_enabled: true, agent_collision: true },
   notifications: { notify_assignee: true, notify_group_on_new: true, notify_requester_on_reply: true },
   security: { min_password_length: 8, signup_domains: [] },
@@ -15,16 +15,18 @@ const DEFAULT_SETTINGS = {
   arcade: { enabled: true, resolve_points: 10, sla_bonus: 5, fast_reply_bonus: 5, csat_bonus: 15 },
 };
 
+const pickDefined = (b, cols) => Object.fromEntries(cols.filter((k) => b[k] !== undefined).map((k) => [k, b[k]]));
+
 // Public branding for the login/portal pages.
 router.get('/public', optionalAuth, asyncHandler(async (_req, res) => {
-  const { rows } = await query("SELECT value FROM settings WHERE key = 'helpdesk'");
-  res.json({ data: { ...DEFAULT_SETTINGS.helpdesk, ...(rows[0]?.value || {}) } });
+  const row = await db.findOne('settings', { key: 'helpdesk' });
+  res.json({ data: { ...DEFAULT_SETTINGS.helpdesk, ...(row?.value || {}) } });
 }));
 
 router.use(authenticate, requireAgent);
 
 router.get('/', asyncHandler(async (_req, res) => {
-  const { rows } = await query('SELECT key, value FROM settings');
+  const rows = await db.find('settings', null, { select: ['key', 'value'] });
   const out = { ...DEFAULT_SETTINGS };
   for (const r of rows) out[r.key] = { ...(DEFAULT_SETTINGS[r.key] || {}), ...r.value };
   res.json({ data: out });
@@ -33,75 +35,69 @@ router.get('/', asyncHandler(async (_req, res) => {
 router.put('/:key', requireAdmin, asyncHandler(async (req, res) => {
   const key = req.params.key;
   if (!DEFAULT_SETTINGS[key]) throw badRequest('Unknown settings group');
-  const { rows: existing } = await query('SELECT value FROM settings WHERE key = $1', [key]);
-  const merged = { ...DEFAULT_SETTINGS[key], ...(existing[0]?.value || {}), ...req.body };
-  await query(
-    'INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()',
-    [key, JSON.stringify(merged)]
-  );
+  const existing = await db.findOne('settings', { key });
+  const merged = { ...DEFAULT_SETTINGS[key], ...(existing?.value || {}), ...req.body };
+  const updatedAt = nowIso();
+  await db.upsert('settings', { key }, { key, value: merged, updated_at: updatedAt }, { value: merged, updated_at: updatedAt });
   res.json({ data: merged });
 }));
 
 // ---------------- business hours
 router.get('/business-hours', asyncHandler(async (_req, res) => {
-  const { rows } = await query('SELECT * FROM business_hours ORDER BY is_default DESC, name');
-  res.json({ data: rows });
+  res.json({ data: await db.find('business_hours', null, { order: [['is_default', 'desc'], ['name', 'asc']] }) });
 }));
 router.post('/business-hours', requireAdmin, asyncHandler(async (req, res) => {
   const b = req.body;
   requireFields(b, ['name']);
-  const { rows } = await query(
-    'INSERT INTO business_hours (name, description, time_zone, is_default, always_open, schedule, holidays) VALUES ($1,$2,COALESCE($3,\'UTC\'),COALESCE($4,FALSE),COALESCE($5,FALSE),$6,$7) RETURNING *',
-    [b.name, b.description || null, b.time_zone, b.is_default, b.always_open, JSON.stringify(b.schedule || {}), JSON.stringify(b.holidays || [])]
-  );
-  if (rows[0].is_default) await query('UPDATE business_hours SET is_default = FALSE WHERE id <> $1', [rows[0].id]);
-  res.status(201).json({ data: rows[0] });
+  const row = await db.insert('business_hours', {
+    name: b.name, description: b.description || null, time_zone: b.time_zone ?? 'UTC', is_default: b.is_default ?? false,
+    always_open: b.always_open ?? false, schedule: b.schedule || {}, holidays: b.holidays || [],
+  });
+  if (row.is_default) await db.updateWhere('business_hours', { id: { ne: row.id } }, { is_default: false });
+  res.status(201).json({ data: row });
 }));
 router.put('/business-hours/:id', requireAdmin, asyncHandler(async (req, res) => {
-  const b = { ...req.body };
-  if (b.schedule !== undefined) b.schedule = JSON.stringify(b.schedule);
-  if (b.holidays !== undefined) b.holidays = JSON.stringify(b.holidays);
-  const { sets, values } = buildUpdate(b, ['name', 'description', 'time_zone', 'is_default', 'always_open', 'schedule', 'holidays']);
-  if (!sets.length) throw badRequest('Nothing to update');
-  values.push(req.params.id);
-  const { rows } = await query(`UPDATE business_hours SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`, values);
-  if (!rows[0]) throw notFound('Business hours');
-  if (rows[0].is_default) await query('UPDATE business_hours SET is_default = FALSE WHERE id <> $1', [rows[0].id]);
-  res.json({ data: rows[0] });
+  const patch = pickDefined(req.body, ['name', 'description', 'time_zone', 'is_default', 'always_open', 'schedule', 'holidays']);
+  if (!Object.keys(patch).length) throw badRequest('Nothing to update');
+  const [row] = await db.updateWhere('business_hours', { id: req.params.id }, patch);
+  if (!row) throw notFound('Business hours');
+  if (row.is_default) await db.updateWhere('business_hours', { id: { ne: row.id } }, { is_default: false });
+  res.json({ data: row });
 }));
 router.delete('/business-hours/:id', requireAdmin, asyncHandler(async (req, res) => {
-  await query('DELETE FROM business_hours WHERE id = $1 AND is_default = FALSE', [req.params.id]);
+  await db.removeWhere('business_hours', { id: req.params.id, is_default: false });
   res.json({ ok: true });
 }));
 
 // ---------------- ticket fields (custom fields)
 router.get('/ticket-fields', asyncHandler(async (_req, res) => {
-  const { rows } = await query('SELECT * FROM ticket_fields ORDER BY position, id');
-  res.json({ data: rows });
+  res.json({ data: await db.find('ticket_fields', null, { order: [['position', 'asc'], ['id', 'asc']] }) });
 }));
 router.post('/ticket-fields', requireAdmin, asyncHandler(async (req, res) => {
   const b = req.body;
   requireFields(b, ['label', 'field_type']);
   const name = slugify(b.name || b.label).replace(/-/g, '_');
-  const { rows } = await query(
-    `INSERT INTO ticket_fields (name, label, field_type, options, required_for_agents, required_for_customers, visible_to_customers, position, parent_field)
-     VALUES ($1,$2,$3,$4,COALESCE($5,FALSE),COALESCE($6,FALSE),COALESCE($7,TRUE),COALESCE($8,(SELECT COALESCE(MAX(position),0)+1 FROM ticket_fields)),$9) RETURNING *`,
-    [name, b.label, b.field_type, JSON.stringify(b.options || []), b.required_for_agents, b.required_for_customers, b.visible_to_customers, b.position || null, b.parent_field || null]
-  );
-  res.status(201).json({ data: rows[0] });
+  let position = b.position || null;
+  if (position === null) {
+    const [last] = await db.find('ticket_fields', null, { order: [['position', 'desc']], limit: 1, select: ['position'] });
+    position = (last?.position || 0) + 1;
+  }
+  const row = await db.insert('ticket_fields', {
+    name, label: b.label, field_type: b.field_type, options: b.options || [],
+    required_for_agents: b.required_for_agents ?? false, required_for_customers: b.required_for_customers ?? false,
+    visible_to_customers: b.visible_to_customers ?? true, position, parent_field: b.parent_field || null,
+  });
+  res.status(201).json({ data: row });
 }));
 router.put('/ticket-fields/:id', requireAdmin, asyncHandler(async (req, res) => {
-  const b = { ...req.body };
-  if (b.options !== undefined) b.options = JSON.stringify(b.options);
-  const { sets, values } = buildUpdate(b, ['label', 'field_type', 'options', 'required_for_agents', 'required_for_customers', 'visible_to_customers', 'position', 'parent_field']);
-  if (!sets.length) throw badRequest('Nothing to update');
-  values.push(req.params.id);
-  const { rows } = await query(`UPDATE ticket_fields SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`, values);
-  if (!rows[0]) throw notFound('Ticket field');
-  res.json({ data: rows[0] });
+  const patch = pickDefined(req.body, ['label', 'field_type', 'options', 'required_for_agents', 'required_for_customers', 'visible_to_customers', 'position', 'parent_field']);
+  if (!Object.keys(patch).length) throw badRequest('Nothing to update');
+  const [row] = await db.updateWhere('ticket_fields', { id: req.params.id }, patch);
+  if (!row) throw notFound('Ticket field');
+  res.json({ data: row });
 }));
 router.delete('/ticket-fields/:id', requireAdmin, asyncHandler(async (req, res) => {
-  await query('DELETE FROM ticket_fields WHERE id = $1 AND is_default = FALSE', [req.params.id]);
+  await db.removeWhere('ticket_fields', { id: req.params.id, is_default: false });
   res.json({ ok: true });
 }));
 

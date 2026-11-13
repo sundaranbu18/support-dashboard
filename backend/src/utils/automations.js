@@ -1,4 +1,4 @@
-import { query } from '../config/db.js';
+import { db, indexBy, nowIso } from '../db/index.js';
 import { logActivity } from './activity.js';
 import { notifyUser, notifyGroup } from './notifications.js';
 import { sendEmail } from './email.js';
@@ -20,16 +20,25 @@ async function fireWebhook(url, ticket) {
   } catch (err) { return { url, ok: false, error: err.message }; }
 }
 
+// Requester/company fields for a ticket (contacts LEFT JOIN companies). `lookup` holds prefetched
+// { contacts, companies } Maps so time triggers can evaluate many tickets without extra round trips.
+async function requesterInfo(ticket, lookup) {
+  let contact;
+  let company = null;
+  if (lookup) {
+    contact = lookup.contacts.get(ticket.requester_id);
+    if (contact && contact.company_id != null) company = lookup.companies.get(contact.company_id) || null;
+  } else {
+    contact = ticket.requester_id != null ? await db.get('contacts', ticket.requester_id) : null;
+    if (contact && contact.company_id != null) company = await db.get('companies', contact.company_id);
+  }
+  if (!contact) return {};
+  return { requester_email: contact.email, requester_name: contact.name, company_name: company ? company.name : null, company_domains: company ? company.domains : null };
+}
+
 // Fields exposed to automation conditions.
-async function ticketContext(ticket) {
-  const { rows } = await query(
-    `SELECT c.email AS requester_email, c.name AS requester_name, co.name AS company_name,
-            co.domains AS company_domains
-       FROM contacts c LEFT JOIN companies co ON co.id = c.company_id
-      WHERE c.id = $1`,
-    [ticket.requester_id]
-  );
-  const extra = rows[0] || {};
+async function ticketContext(ticket, lookup) {
+  const extra = await requesterInfo(ticket, lookup);
   const now = Date.now();
   const hours = (d) => (d ? (now - new Date(d).getTime()) / 3600000 : null);
   return {
@@ -134,21 +143,21 @@ async function applyActions(actions, ticket, ruleName) {
   return { updates, notes, notifications, webhooks, emails };
 }
 
+const activeRules = (event) => db.find('automations', { is_active: true, event }, { order: [['position', 'asc'], ['id', 'asc']] });
+
 // Runs automations for an event against a ticket. Returns the (possibly updated) ticket row.
-export async function runAutomations(event, ticket) {
-  const { rows: rules } = await query(
-    'SELECT * FROM automations WHERE is_active = TRUE AND event = $1 ORDER BY position ASC, id ASC',
-    [event]
-  );
+// `preloaded` ({ rules, lookup }) is used by runTimeTriggers to avoid per-ticket reads.
+export async function runAutomations(event, ticket, preloaded = null) {
+  const rules = preloaded?.rules || (await activeRules(event));
   if (rules.length === 0) return ticket;
 
   let current = ticket;
   for (const rule of rules) {
-    const ctx = await ticketContext(current);
+    const ctx = await ticketContext(current, preloaded?.lookup);
     if (!evaluateConditions(rule.conditions, ctx)) continue;
 
     current = await executeActions(rule.actions, current, { label: 'Automation', name: rule.name, action: 'automation' });
-    await query('UPDATE automations SET run_count = run_count + 1, last_run_at = NOW() WHERE id = $1', [rule.id]);
+    await db.update('automations', rule.id, { last_run_at: nowIso() }, { inc: { run_count: 1 } });
   }
   return current;
 }
@@ -164,23 +173,20 @@ export async function executeActions(actions, ticket, { label, name, action, act
     }
 
     if (Object.keys(changes).length) {
-      const keys = Object.keys(changes);
-      const sets = keys.map((k, i) => `${k} = $${i + 2}`);
-      const vals = keys.map((k) => updates[k]);
-      if (updates.status === 'resolved' && !current.resolved_at) { sets.push('resolved_at = NOW()'); }
-      if (updates.status === 'closed' && !current.closed_at) { sets.push('closed_at = NOW()', 'resolved_at = COALESCE(resolved_at, NOW())'); }
-      if (updates.status && !['resolved', 'closed'].includes(updates.status)) { sets.push('resolved_at = NULL', 'closed_at = NULL'); }
-      const { rows } = await query(
-        `UPDATE tickets SET ${sets.join(', ')} WHERE id = $1 RETURNING *`,
-        [current.id, ...vals]
-      );
-      current = rows[0];
+      const now = nowIso();
+      const patch = {};
+      for (const k of Object.keys(changes)) patch[k] = updates[k];
+      if (updates.status === 'resolved' && !current.resolved_at) patch.resolved_at = now;
+      if (updates.status === 'closed' && !current.closed_at) {
+        patch.closed_at = now;
+        if (!current.resolved_at) patch.resolved_at = now; // COALESCE(resolved_at, NOW())
+      }
+      if (updates.status && !['resolved', 'closed'].includes(updates.status)) { patch.resolved_at = null; patch.closed_at = null; }
+      const [row] = await db.updateWhere('tickets', { id: current.id }, patch);
+      current = row;
     }
-    for (const n of notes) {
-      await query(
-        `INSERT INTO conversations (ticket_id, kind, is_private, body, source) VALUES ($1, 'note', TRUE, $2, 'automation')`,
-        [current.id, n]
-      );
+    if (notes.length) {
+      await db.insertMany('conversations', notes.map((n) => ({ ticket_id: current.id, kind: 'note', is_private: true, body: n, source: 'automation' })));
     }
     for (const n of notifications) {
       const payload = {
@@ -195,9 +201,11 @@ export async function executeActions(actions, ticket, { label, name, action, act
     }
     const webhookResults = [];
     for (const url of webhooks) webhookResults.push(await fireWebhook(url, current));
-    for (const e of emails) {
-      const { rows: [c] } = await query('SELECT email FROM contacts WHERE id = $1', [current.requester_id]);
-      await sendEmail({ to: c?.email, subject: `Re: ${current.subject} [#${current.id}]`, body: e.body || '', ticketId: current.id });
+    if (emails.length) {
+      const c = current.requester_id != null ? await db.get('contacts', current.requester_id) : null;
+      for (const e of emails) {
+        await sendEmail({ to: c?.email, subject: `Re: ${current.subject} [#${current.id}]`, body: e.body || '', ticketId: current.id });
+      }
     }
     if (Object.keys(changes).length || notes.length || notifications.length || webhooks.length || emails.length) {
       await logActivity(current.id, actor, action, { rule: name, changes, notes: notes.length, webhooks: webhookResults });
@@ -208,17 +216,18 @@ export async function executeActions(actions, ticket, { label, name, action, act
 
 // Time-based rules (Freshdesk "Supervisor"): evaluated periodically on unresolved tickets.
 export async function runTimeTriggers() {
-  const { rows: rules } = await query(
-    "SELECT id FROM automations WHERE is_active = TRUE AND event = 'time_trigger'"
-  );
+  const rules = await activeRules('time_trigger');
   if (rules.length === 0) return 0;
-  const { rows: tickets } = await query(
-    "SELECT * FROM tickets WHERE status NOT IN ('resolved','closed') AND deleted = FALSE AND spam = FALSE"
-  );
+  const { tickets, contacts, companies } = await db.fetch({
+    tickets: ['tickets', { status: { nin: ['resolved', 'closed'] }, deleted: false, spam: false }],
+    contacts: ['contacts'],
+    companies: ['companies'],
+  });
+  const lookup = { contacts: indexBy(contacts), companies: indexBy(companies) };
   let touched = 0;
   for (const t of tickets) {
     const before = JSON.stringify(t);
-    const after = await runAutomations('time_trigger', t);
+    const after = await runAutomations('time_trigger', t, { rules, lookup });
     if (JSON.stringify(after) !== before) touched++;
   }
   return touched;

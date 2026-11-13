@@ -1,6 +1,7 @@
-// Seeds a realistic demo helpdesk. Safe to re-run after `db:migrate --fresh`.
+// Seeds a realistic demo helpdesk. Skips when users already exist; `npm run db:reset` wipes and reseeds.
 import bcrypt from 'bcryptjs';
-import { pool, query } from '../config/db.js';
+import { db, localDay } from './index.js';
+import { ensureDefaults } from './defaults.js';
 import { computeDueDates } from '../utils/sla.js';
 
 // Deterministic pseudo-random so the demo looks the same each time.
@@ -12,10 +13,9 @@ const hoursAgo = (h) => new Date(Date.now() - h * 3600000);
 const addHours = (d, h) => new Date(new Date(d).getTime() + h * 3600000);
 
 async function main() {
-  const { rows: existing } = await query('SELECT COUNT(*) FROM users');
-  if (Number(existing[0].count) > 0) {
-    console.log('Database already seeded. Run `npm run db:reset` for a fresh seed.');
-    await pool.end();
+  await ensureDefaults();
+  if ((await db.count('users')) > 0) {
+    console.log('Database already seeded. Run `npm run db:reset` to wipe all data and reseed.');
     return;
   }
 
@@ -30,14 +30,9 @@ async function main() {
     ['Diego Alvarez', 'diego@supportdesk.local', 'agent', 'Technical Support Lead'],
     ['Aisha Khan', 'aisha@supportdesk.local', 'agent', 'Customer Success'],
   ];
-  const agents = [];
-  for (const [name, email, role, title] of agentsData) {
-    const { rows } = await query(
-      'INSERT INTO users (name, email, password_hash, role, job_title, signature) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-      [name, email, hash, role, title, `Best regards,\n${name}\n${title} · Wadhwani Foundation`]
-    );
-    agents.push(rows[0]);
-  }
+  const agents = await db.insertMany('users', agentsData.map(([name, email, role, title]) => ({
+    name, email, password_hash: hash, role, job_title: title, signature: `Best regards,\n${name}\n${title} · Wadhwani Foundation`,
+  })));
   const [admin, priya, marcus, elena, diego, aisha] = agents;
 
   // ---------------- groups
@@ -47,12 +42,8 @@ async function main() {
     ['Billing', 'Invoices, refunds and subscription changes', [elena], false],
     ['Customer Success', 'Onboarding and account management', [aisha, admin], false],
   ];
-  const groups = [];
-  for (const [name, desc, members, auto] of groupsData) {
-    const { rows } = await query('INSERT INTO groups (name, description, auto_assign, escalate_to_user_id) VALUES ($1,$2,$3,$4) RETURNING *', [name, desc, auto, admin.id]);
-    for (const m of members) await query('INSERT INTO group_members (group_id, user_id) VALUES ($1,$2)', [rows[0].id, m.id]);
-    groups.push(rows[0]);
-  }
+  const groups = await db.insertMany('groups', groupsData.map(([name, desc, , auto]) => ({ name, description: desc, auto_assign: auto, escalate_to_user_id: admin.id })));
+  await db.insertMany('group_members', groupsData.flatMap(([, , members], gi) => members.map((m) => ({ group_id: groups[gi].id, user_id: m.id }))));
   const [tier1, tech, billing, success] = groups;
 
   // ---------------- companies
@@ -64,86 +55,87 @@ async function main() {
     ['Stark Retail', ['starkretail.com'], 'Retail', 'standard', 'neutral'],
     ['Wayne Financial', ['waynefin.com'], 'Finance', 'premium', 'neutral'],
   ];
-  const companies = [];
-  for (const [name, domains, industry, tier, health] of companiesData) {
-    const { rows } = await query(
-      'INSERT INTO companies (name, domains, industry, account_tier, health_score, description, renewal_date) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-      [name, domains, industry, tier, health, `${name} is a ${industry.toLowerCase()} customer on the ${tier} plan.`, new Date(Date.now() + (30 + Math.floor(rand() * 300)) * 86400000)]
-    );
-    companies.push(rows[0]);
-  }
+  const companies = await db.insertMany('companies', companiesData.map(([name, domains, industry, tier, health]) => ({
+    name, domains, industry, account_tier: tier, health_score: health,
+    description: `${name} is a ${industry.toLowerCase()} customer on the ${tier} plan.`,
+    renewal_date: localDay(new Date(Date.now() + (30 + Math.floor(rand() * 300)) * 86400000)),
+  })));
 
   // ---------------- contacts (first one has portal access)
   const first = ['James', 'Olivia', 'Liam', 'Emma', 'Noah', 'Ava', 'Ethan', 'Sophia', 'Mason', 'Isabella', 'Lucas', 'Mia', 'Aiden', 'Charlotte', 'Rahul', 'Meera', 'Chen', 'Yuki', 'Fatima', 'Carlos'];
   const last = ['Smith', 'Johnson', 'Brown', 'Taylor', 'Anderson', 'Thomas', 'Jackson', 'White', 'Harris', 'Martin', 'Patel', 'Nair', 'Wang', 'Tanaka', 'Hassan', 'Garcia'];
-  const contacts = [];
-  const { rows: demoContact } = await query(
-    'INSERT INTO contacts (name, email, phone, company_id, job_title, password_hash, is_verified, tags) VALUES ($1,$2,$3,$4,$5,$6,TRUE,$7) RETURNING *',
-    ['Jane Customer', 'customer@acme.com', '+1 555 0100', companies[0].id, 'Operations Manager', hash, ['vip']]
-  );
-  contacts.push(demoContact[0]);
+  const contactDocs = [
+    { name: 'Jane Customer', email: 'customer@acme.com', phone: '+1 555 0100', company_id: companies[0].id, job_title: 'Operations Manager', password_hash: hash, is_verified: true, tags: ['vip'] },
+  ];
   for (let i = 0; i < 26; i++) {
     const fn = first[i % first.length];
     const ln = last[(i * 7) % last.length];
     const company = chance(0.8) ? pick(companies) : null;
     const domain = company ? company.domains[0] : pick(['gmail.com', 'outlook.com', 'yahoo.com']);
     const email = `${fn.toLowerCase()}.${ln.toLowerCase()}${i}@${domain}`;
-    const { rows } = await query(
-      'INSERT INTO contacts (name, email, phone, company_id, job_title, tags, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-      [`${fn} ${ln}`, email, chance(0.6) ? `+1 555 01${String(i).padStart(2, '0')}` : null, company?.id || null, pick(['IT Manager', 'Developer', 'Procurement', 'Office Admin', 'CTO', 'Analyst', null]), chance(0.2) ? ['vip'] : [], hoursAgo(24 * (10 + rand() * 120))]
-    );
-    contacts.push(rows[0]);
+    contactDocs.push({
+      name: `${fn} ${ln}`, email, phone: chance(0.6) ? `+1 555 01${String(i).padStart(2, '0')}` : null, company_id: company?.id || null,
+      job_title: pick(['IT Manager', 'Developer', 'Procurement', 'Office Admin', 'CTO', 'Analyst', null]), tags: chance(0.2) ? ['vip'] : [], created_at: hoursAgo(24 * (10 + rand() * 120)),
+    });
   }
+  const contacts = await db.insertMany('contacts', contactDocs);
 
   // ---------------- tags
   const tagNames = ['billing', 'bug', 'login', 'feature-request', 'urgent-escalation', 'integration', 'api', 'mobile', 'refund', 'onboarding', 'performance', 'vip'];
   const colors = ['#2563eb', '#dc2626', '#d97706', '#7c3aed', '#db2777', '#059669', '#0891b2', '#4f46e5', '#ea580c', '#16a34a', '#9333ea', '#f59e0b'];
-  for (let i = 0; i < tagNames.length; i++) await query('INSERT INTO tags (name, color) VALUES ($1,$2)', [tagNames[i], colors[i]]);
+  await db.insertMany('tags', tagNames.map((name, i) => ({ name, color: colors[i] })));
 
   // ---------------- SLA policies
-  const { rows: [defaultSla] } = await query(
-    `INSERT INTO sla_policies (name, description, is_default, position, targets) VALUES ($1,$2,TRUE,99,$3) RETURNING *`,
-    ['Default policy', 'Applies to every ticket not matched by another policy.', JSON.stringify({
-      urgent: { respond_within: 60, resolve_within: 240 },
-      high: { respond_within: 240, resolve_within: 480 },
-      medium: { respond_within: 480, resolve_within: 1440 },
-      low: { respond_within: 1440, resolve_within: 4320 },
-    })]
-  );
-  const { rows: [enterpriseSla] } = await query(
-    `INSERT INTO sla_policies (name, description, position, conditions, targets) VALUES ($1,$2,1,$3,$4) RETURNING *`,
-    ['Enterprise accounts', 'Faster targets for enterprise and premium customers.',
-      JSON.stringify({ company_id: companies.filter((c) => c.account_tier !== 'standard').map((c) => c.id) }),
-      JSON.stringify({
+  const [defaultSla, enterpriseSla] = await db.insertMany('sla_policies', [
+    {
+      name: 'Default policy', description: 'Applies to every ticket not matched by another policy.', is_default: true, position: 99,
+      targets: {
+        urgent: { respond_within: 60, resolve_within: 240 },
+        high: { respond_within: 240, resolve_within: 480 },
+        medium: { respond_within: 480, resolve_within: 1440 },
+        low: { respond_within: 1440, resolve_within: 4320 },
+      },
+    },
+    {
+      name: 'Enterprise accounts', description: 'Faster targets for enterprise and premium customers.', position: 1,
+      conditions: { company_id: companies.filter((c) => c.account_tier !== 'standard').map((c) => c.id) },
+      targets: {
         urgent: { respond_within: 30, resolve_within: 120 },
         high: { respond_within: 60, resolve_within: 240 },
         medium: { respond_within: 240, resolve_within: 720 },
         low: { respond_within: 480, resolve_within: 1440 },
-      })]
-  );
+      },
+    },
+  ]);
 
   // ---------------- automations
-  await query(
-    `INSERT INTO automations (name, description, event, conditions, actions, position) VALUES
-     ($1,$2,'ticket_created',$3,$4,1), ($5,$6,'ticket_created',$7,$8,2), ($9,$10,'ticket_created',$11,$12,3), ($13,$14,'time_trigger',$15,$16,1), ($17,$18,'ticket_updated',$19,$20,1)`,
-    [
-      'Route billing questions', 'Send anything mentioning invoices or refunds to the Billing group.',
-      JSON.stringify({ match: 'any', rules: [{ field: 'subject', operator: 'contains', value: 'invoice' }, { field: 'subject', operator: 'contains', value: 'refund' }, { field: 'type', operator: 'is', value: 'refund' }] }),
-      JSON.stringify([{ type: 'assign_group', value: billing.id }, { type: 'add_tag', value: 'billing' }]),
-      'Escalate urgent incidents', 'Urgent incidents go straight to Technical Support and get flagged.',
-      JSON.stringify({ match: 'all', rules: [{ field: 'priority', operator: 'is', value: 'urgent' }, { field: 'type', operator: 'is', value: 'incident' }] }),
-      JSON.stringify([{ type: 'assign_group', value: tech.id }, { type: 'add_tag', value: 'urgent-escalation' }, { type: 'notify_group', value: tech.id, message: 'Urgent incident needs attention' }]),
-      'Tag enterprise tickets as VIP', 'Tickets from Acme are tagged for visibility.',
-      JSON.stringify({ match: 'all', rules: [{ field: 'requester_domain', operator: 'is', value: 'acme.com' }] }),
-      JSON.stringify([{ type: 'add_tag', value: 'vip' }]),
-      'Nudge stale tickets', 'If a ticket is unassigned for over 24 hours, bump priority and notify Tier 1.',
-      JSON.stringify({ match: 'all', rules: [{ field: 'has_responder', operator: 'is', value: false }, { field: 'hours_since_created', operator: 'greater_than', value: 24 }, { field: 'priority', operator: 'is', value: 'low' }] }),
-      JSON.stringify([{ type: 'set_priority', value: 'medium' }, { type: 'notify_group', value: tier1.id, message: 'Unassigned ticket waiting more than 24h' }, { type: 'add_note', value: 'Automation: priority raised because the ticket stayed unassigned for more than 24 hours.' }]),
-      'Notify assignee on reopen', 'When a resolved ticket is reopened, tell the assignee.',
-      JSON.stringify({ match: 'all', rules: [{ field: 'status', operator: 'is', value: 'open' }, { field: 'first_responded', operator: 'is', value: true }] }),
-      JSON.stringify([{ type: 'notify_assignee', message: 'A ticket you handled is open again' }]),
-    ]
-  );
+  await db.insertMany('automations', [
+    {
+      name: 'Route billing questions', description: 'Send anything mentioning invoices or refunds to the Billing group.', event: 'ticket_created', position: 1,
+      conditions: { match: 'any', rules: [{ field: 'subject', operator: 'contains', value: 'invoice' }, { field: 'subject', operator: 'contains', value: 'refund' }, { field: 'type', operator: 'is', value: 'refund' }] },
+      actions: [{ type: 'assign_group', value: billing.id }, { type: 'add_tag', value: 'billing' }],
+    },
+    {
+      name: 'Escalate urgent incidents', description: 'Urgent incidents go straight to Technical Support and get flagged.', event: 'ticket_created', position: 2,
+      conditions: { match: 'all', rules: [{ field: 'priority', operator: 'is', value: 'urgent' }, { field: 'type', operator: 'is', value: 'incident' }] },
+      actions: [{ type: 'assign_group', value: tech.id }, { type: 'add_tag', value: 'urgent-escalation' }, { type: 'notify_group', value: tech.id, message: 'Urgent incident needs attention' }],
+    },
+    {
+      name: 'Tag enterprise tickets as VIP', description: 'Tickets from Acme are tagged for visibility.', event: 'ticket_created', position: 3,
+      conditions: { match: 'all', rules: [{ field: 'requester_domain', operator: 'is', value: 'acme.com' }] },
+      actions: [{ type: 'add_tag', value: 'vip' }],
+    },
+    {
+      name: 'Nudge stale tickets', description: 'If a ticket is unassigned for over 24 hours, bump priority and notify Tier 1.', event: 'time_trigger', position: 1,
+      conditions: { match: 'all', rules: [{ field: 'has_responder', operator: 'is', value: false }, { field: 'hours_since_created', operator: 'greater_than', value: 24 }, { field: 'priority', operator: 'is', value: 'low' }] },
+      actions: [{ type: 'set_priority', value: 'medium' }, { type: 'notify_group', value: tier1.id, message: 'Unassigned ticket waiting more than 24h' }, { type: 'add_note', value: 'Automation: priority raised because the ticket stayed unassigned for more than 24 hours.' }],
+    },
+    {
+      name: 'Notify assignee on reopen', description: 'When a resolved ticket is reopened, tell the assignee.', event: 'ticket_updated', position: 1,
+      conditions: { match: 'all', rules: [{ field: 'status', operator: 'is', value: 'open' }, { field: 'first_responded', operator: 'is', value: true }] },
+      actions: [{ type: 'notify_assignee', message: 'A ticket you handled is open again' }],
+    },
+  ]);
 
   // ---------------- canned responses
   const canned = [
@@ -154,13 +146,13 @@ async function main() {
     ['Issue resolved - closing', 'Hi {{requester_name}},\n\nI am glad we could sort this out. I am marking this ticket as resolved; if anything comes up again just reply to this message and it will reopen automatically.\n\n{{agent_name}}', 'General'],
     ['Escalated to engineering', 'Hi {{requester_name}},\n\nI have escalated this to our engineering team as a confirmed bug. We will keep this ticket updated as the fix progresses and let you know as soon as it is released.\n\n{{agent_name}}', 'Technical'],
   ];
-  for (const [title, content, folder] of canned) await query('INSERT INTO canned_responses (title, content, folder, user_id) VALUES ($1,$2,$3,$4)', [title, content, folder, admin.id]);
+  await db.insertMany('canned_responses', canned.map(([title, content, folder]) => ({ title, content, folder, user_id: admin.id })));
 
   // ---------------- knowledge base
   const kb = [
     ['Getting Started', 'Everything you need to set up your account', [
       ['Account setup', [
-        ['Creating your account', 'To create an account, click Sign up on the login page and fill in your name, work email and a password of at least 6 characters.\n\nIf your company already uses Wadhwani Support, your account is linked to it automatically based on your email domain.\n\nAfter signing up you can immediately submit tickets and track them in the portal.'],
+        ['Creating your account', 'To create an account, click Sign up on the login page and fill in your name, work email and a password of at least 6 characters.\n\nIf your company already uses Nexus, your account is linked to it automatically based on your email domain.\n\nAfter signing up you can immediately submit tickets and track them in the portal.'],
         ['Inviting teammates', 'Account admins can invite teammates from Admin > Agents. Each agent receives a login and can be added to one or more groups.\n\nGroups control which tickets an agent sees by default and who gets notified about new tickets.'],
         ['Resetting your password', 'Use the Forgot password link on the login page. A reset link is emailed to you and remains valid for 30 minutes.\n\nIf you do not receive the email within a few minutes, check your spam folder or contact support.'],
       ]],
@@ -186,46 +178,43 @@ async function main() {
       ['Integrations & API', [
         ['Generating an API key', 'API keys are created under Admin > Integrations > API. Keys are shown once; store them securely. Rotate keys at least every 90 days.\n\nAll requests must include the header Authorization: Bearer <key>.'],
         ['Webhook delivery failures', 'Webhooks retry 5 times with exponential backoff. Check that your endpoint responds with a 2xx status within 10 seconds, and that it accepts POST requests with a JSON body.'],
-        ['Slack integration setup', 'Install the Wadhwani Support Slack app from Admin > Integrations. Choose a channel for new ticket notifications and optionally enable reply-from-Slack for agents.'],
+        ['Slack integration setup', 'Install the Nexus Slack app from Admin > Integrations. Choose a channel for new ticket notifications and optionally enable reply-from-Slack for agents.'],
       ]],
     ]],
   ];
-  let catPos = 1;
-  for (const [cname, cdesc, folders] of kb) {
-    const { rows: [cat] } = await query('INSERT INTO kb_categories (name, description, position) VALUES ($1,$2,$3) RETURNING *', [cname, cdesc, catPos++]);
-    let fPos = 1;
+  const cats = await db.insertMany('kb_categories', kb.map(([cname, cdesc], ci) => ({ name: cname, description: cdesc, position: ci + 1 })));
+  const folderRows = await db.insertMany('kb_folders', kb.flatMap(([, , folders], ci) => folders.map(([fname], fi) => ({ category_id: cats[ci].id, name: fname, position: fi + 1 }))));
+  const articleDocs = [];
+  let folderIdx = 0;
+  for (const [, , folders] of kb) {
     for (const [fname, articles] of folders) {
-      const { rows: [folder] } = await query('INSERT INTO kb_folders (category_id, name, position) VALUES ($1,$2,$3) RETURNING *', [cat.id, fname, fPos++]);
+      const folder = folderRows[folderIdx++];
       for (const [title, body] of articles) {
         const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-        await query(
-          'INSERT INTO kb_articles (folder_id, title, slug, body, status, author_id, views, thumbs_up, thumbs_down, published_at, tags) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
-          [folder.id, title, slug, body, 'published', pick(agents).id, Math.floor(rand() * 900), Math.floor(rand() * 40), Math.floor(rand() * 6), hoursAgo(24 * rand() * 90), [fname.toLowerCase().split(' ')[0]]]
-        );
+        articleDocs.push({
+          folder_id: folder.id, title, slug, body, status: 'published', author_id: pick(agents).id,
+          views: Math.floor(rand() * 900), thumbs_up: Math.floor(rand() * 40), thumbs_down: Math.floor(rand() * 6), published_at: hoursAgo(24 * rand() * 90), tags: [fname.toLowerCase().split(' ')[0]],
+        });
       }
     }
   }
-  await query(
-    'INSERT INTO kb_articles (folder_id, title, slug, body, status, author_id) VALUES ((SELECT id FROM kb_folders ORDER BY id LIMIT 1), $1,$2,$3,$4,$5)',
-    ['Mobile app overview (draft)', 'mobile-app-overview', 'Draft article describing the upcoming mobile app features.', 'draft', priya.id]
-  );
+  articleDocs.push({ folder_id: folderRows[0].id, title: 'Mobile app overview (draft)', slug: 'mobile-app-overview', body: 'Draft article describing the upcoming mobile app features.', status: 'draft', author_id: priya.id });
+  await db.insertMany('kb_articles', articleDocs);
 
   // ---------------- business hours, ticket fields, settings
-  await query(
-    `INSERT INTO business_hours (name, description, time_zone, is_default, schedule) VALUES ($1,$2,$3,TRUE,$4)`,
-    ['Default business hours', 'Monday to Friday, 9am to 6pm', 'America/New_York', JSON.stringify({ mon: { start: '09:00', end: '18:00' }, tue: { start: '09:00', end: '18:00' }, wed: { start: '09:00', end: '18:00' }, thu: { start: '09:00', end: '18:00' }, fri: { start: '09:00', end: '18:00' } })]
-  );
-  await query(
-    `INSERT INTO ticket_fields (name, label, field_type, options, position, visible_to_customers) VALUES
-     ('product', 'Product', 'dropdown', '["Web app","Mobile app","API","Billing portal"]', 1, TRUE),
-     ('environment', 'Environment', 'dropdown', '["Production","Staging","Development"]', 2, FALSE),
-     ('order_number', 'Order number', 'text', '[]', 3, TRUE)`
-  );
-  await query(
-    `INSERT INTO settings (key, value) VALUES
-     ('helpdesk', '{"name":"Wadhwani Support","portal_name":"Help Center","support_email":"support@supportdesk.local","primary_color":"#BF2026","time_zone":"America/New_York","portal_signup_enabled":true}'),
-     ('tickets', '{"default_priority":"low","default_status":"open","auto_close_after_days":7,"allow_customer_close":true,"csat_enabled":true,"agent_collision":true}')`
-  );
+  await db.insert('business_hours', {
+    name: 'Default business hours', description: 'Monday to Friday, 9am to 6pm', time_zone: 'America/New_York', is_default: true,
+    schedule: { mon: { start: '09:00', end: '18:00' }, tue: { start: '09:00', end: '18:00' }, wed: { start: '09:00', end: '18:00' }, thu: { start: '09:00', end: '18:00' }, fri: { start: '09:00', end: '18:00' } },
+  });
+  await db.insertMany('ticket_fields', [
+    { name: 'product', label: 'Product', field_type: 'dropdown', options: ['Web app', 'Mobile app', 'API', 'Billing portal'], position: 1, visible_to_customers: true },
+    { name: 'environment', label: 'Environment', field_type: 'dropdown', options: ['Production', 'Staging', 'Development'], position: 2, visible_to_customers: false },
+    { name: 'order_number', label: 'Order number', field_type: 'text', options: [], position: 3, visible_to_customers: true },
+  ]);
+  await db.insertMany('settings', [
+    { key: 'helpdesk', value: { name: 'Nexus', portal_name: 'Nexus Help Center', support_email: 'support@supportdesk.local', primary_color: '#BF2026', time_zone: 'America/New_York', portal_signup_enabled: true } },
+    { key: 'tickets', value: { default_priority: 'low', default_status: 'open', auto_close_after_days: 7, allow_customer_close: true, csat_enabled: true, agent_collision: true } },
+  ]);
 
   // ---------------- tickets
   const subjects = [
@@ -284,7 +273,11 @@ async function main() {
     'Any update on this? It is becoming urgent for our team.',
   ];
 
-  const ticketIds = [];
+  // Ticket rows and their child rows are built in the same order (and with the same rand() calls)
+  // as before, then written in bulk. Child rows reference their ticket by index until ids are known.
+  const ticketDocs = [];
+  const children = { ticket_activities: [], conversations: [], time_entries: [], satisfaction_ratings: [] };
+  const child = (table, ti, doc) => children[table].push({ ti, doc });
   for (let i = 0; i < subjects.length; i++) {
     const [subject, type, priority, tags, description] = subjects[i];
     const requester = i === 0 || i === 4 || i === 29 ? contacts[0] : pick(contacts);
@@ -308,75 +301,73 @@ async function main() {
     const resolvedAt = ['resolved', 'closed'].includes(status) ? addHours(firstResponded || createdAt, 1 + rand() * 60) : null;
     const closedAt = status === 'closed' ? addHours(resolvedAt, 24 * (1 + rand() * 5)) : null;
 
-    const { rows: [t] } = await query(
-      `INSERT INTO tickets (subject, description, status, priority, type, source, requester_id, responder_id, group_id, company_id, tags, sla_policy_id, fr_due_by, due_by,
-                            first_responded_at, resolved_at, closed_at, spam, is_escalated, custom_fields, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) RETURNING *`,
-      [subject, description, status, priority, type, pick(sources), requester.id, responder?.id || null, group.id, requester.company_id, tags, policy.id, due.fr_due_by, due.due_by,
-       firstResponded, resolvedAt, closedAt, isSpam, !resolvedAt && due.due_by < new Date() && status !== 'pending',
-       JSON.stringify({ product: pick(['Web app', 'Mobile app', 'API', 'Billing portal']) }), createdAt, closedAt || resolvedAt || firstResponded || createdAt]
-    );
-    ticketIds.push(t.id);
-    await query('INSERT INTO ticket_activities (ticket_id, contact_id, actor_label, action, details, created_at) VALUES ($1,$2,$3,$4,$5,$6)', [t.id, requester.id, requester.name, 'created', JSON.stringify({ status: 'open', priority }), createdAt]);
+    ticketDocs.push({
+      subject, description, status, priority, type, source: pick(sources), requester_id: requester.id, responder_id: responder?.id || null, group_id: group.id,
+      company_id: requester.company_id, tags, sla_policy_id: policy.id, fr_due_by: due.fr_due_by, due_by: due.due_by,
+      first_responded_at: firstResponded, resolved_at: resolvedAt, closed_at: closedAt, spam: isSpam, is_escalated: !resolvedAt && due.due_by < new Date() && status !== 'pending',
+      custom_fields: { product: pick(['Web app', 'Mobile app', 'API', 'Billing portal']) }, created_at: createdAt, updated_at: closedAt || resolvedAt || firstResponded || createdAt,
+    });
+    child('ticket_activities', i, { contact_id: requester.id, actor_label: requester.name, action: 'created', details: { status: 'open', priority }, created_at: createdAt });
 
     // Conversation thread
     if (responder && firstResponded) {
       let cursor = firstResponded;
       const n = 1 + Math.floor(rand() * 3);
       for (let r = 0; r < n; r++) {
-        await query(
-          'INSERT INTO conversations (ticket_id, user_id, kind, body, source, created_at) VALUES ($1,$2,$3,$4,$5,$6)',
-          [t.id, responder.id, 'reply', `Hi ${requester.name.split(' ')[0]},\n\n${replies[Math.min(r, replies.length - 1)]}\n\n${responder.name}`, 'agent', cursor]
-        );
-        await query('INSERT INTO ticket_activities (ticket_id, user_id, actor_label, action, details, created_at) VALUES ($1,$2,$3,$4,$5,$6)', [t.id, responder.id, responder.name, 'agent_replied', '{}', cursor]);
+        child('conversations', i, { user_id: responder.id, kind: 'reply', body: `Hi ${requester.name.split(' ')[0]},\n\n${replies[Math.min(r, replies.length - 1)]}\n\n${responder.name}`, source: 'agent', created_at: cursor });
+        child('ticket_activities', i, { user_id: responder.id, actor_label: responder.name, action: 'agent_replied', details: {}, created_at: cursor });
         if (chance(0.7) && (!resolvedAt || cursor < resolvedAt)) {
           cursor = addHours(cursor, 1 + rand() * 12);
-          await query(
-            'INSERT INTO conversations (ticket_id, contact_id, kind, body, source, created_at) VALUES ($1,$2,$3,$4,$5,$6)',
-            [t.id, requester.id, 'reply', pick(customerReplies), 'portal', cursor]
-          );
+          child('conversations', i, { contact_id: requester.id, kind: 'reply', body: pick(customerReplies), source: 'portal', created_at: cursor });
         }
         cursor = addHours(cursor, 1 + rand() * 8);
       }
       if (chance(0.5)) {
-        await query(
-          'INSERT INTO conversations (ticket_id, user_id, kind, is_private, body, source, created_at) VALUES ($1,$2,$3,TRUE,$4,$5,$6)',
-          [t.id, responder.id, 'note', pick(['Checked the logs - looks like a config issue on their account.', 'Customer is VIP, prioritise this.', 'Waiting on engineering ticket ENG-1422.', 'Called the customer, left voicemail.']), 'agent', addHours(firstResponded, 0.5)]
-        );
+        child('conversations', i, {
+          user_id: responder.id, kind: 'note', is_private: true,
+          body: pick(['Checked the logs - looks like a config issue on their account.', 'Customer is VIP, prioritise this.', 'Waiting on engineering ticket ENG-1422.', 'Called the customer, left voicemail.']),
+          source: 'agent', created_at: addHours(firstResponded, 0.5),
+        });
       }
       if (chance(0.6)) {
-        await query('INSERT INTO time_entries (ticket_id, user_id, minutes, note, billable, started_at) VALUES ($1,$2,$3,$4,$5,$6)', [t.id, responder.id, 10 + Math.floor(rand() * 80), pick(['Investigation', 'Customer call', 'Fix and verification', null]), chance(0.7), firstResponded]);
+        child('time_entries', i, { user_id: responder.id, minutes: 10 + Math.floor(rand() * 80), note: pick(['Investigation', 'Customer call', 'Fix and verification', null]), billable: chance(0.7), started_at: firstResponded });
       }
       if (resolvedAt) {
-        await query('INSERT INTO ticket_activities (ticket_id, user_id, actor_label, action, details, created_at) VALUES ($1,$2,$3,$4,$5,$6)', [t.id, responder.id, responder.name, 'updated', JSON.stringify({ changes: { status: { from: 'pending', to: 'resolved' } } }), resolvedAt]);
+        child('ticket_activities', i, { user_id: responder.id, actor_label: responder.name, action: 'updated', details: { changes: { status: { from: 'pending', to: 'resolved' } } }, created_at: resolvedAt });
         if (chance(0.65)) {
           const rating = pick([5, 5, 5, 4, 4, 3, 2, 1]);
-          await query('INSERT INTO satisfaction_ratings (ticket_id, contact_id, agent_id, rating, feedback, created_at) VALUES ($1,$2,$3,$4,$5,$6)', [t.id, requester.id, responder.id, rating, rating >= 4 ? pick(['Great support, thank you!', 'Fast and friendly.', 'Solved my problem quickly.', null]) : pick(['Took too long to get a response.', 'Issue was not fully resolved.', null]), addHours(resolvedAt, 2)]);
+          child('satisfaction_ratings', i, {
+            contact_id: requester.id, agent_id: responder.id, rating,
+            feedback: rating >= 4 ? pick(['Great support, thank you!', 'Fast and friendly.', 'Solved my problem quickly.', null]) : pick(['Took too long to get a response.', 'Issue was not fully resolved.', null]),
+            created_at: addHours(resolvedAt, 2),
+          });
         }
       }
     }
   }
+  const ticketRows = await db.insertMany('tickets', ticketDocs);
+  const ticketIds = ticketRows.map((t) => t.id);
+  for (const [table, rows] of Object.entries(children)) {
+    await db.insertMany(table, rows.map(({ ti, doc }) => ({ ticket_id: ticketIds[ti], ...doc })));
+  }
 
   // Watchers, saved views, notifications
-  await query('INSERT INTO ticket_watchers (ticket_id, user_id) VALUES ($1,$2), ($3,$2)', [ticketIds[2], admin.id, ticketIds[12]]);
-  await query(
-    `INSERT INTO saved_views (user_id, name, filters, visibility) VALUES
-     ($1, 'Urgent & high priority', '{"priority":["urgent","high"],"status":["open","pending"]}', 'all_agents'),
-     ($1, 'Billing queue', '{"group_id":[${billing.id}],"status":["open","pending"]}', 'all_agents'),
-     ($1, 'Bugs awaiting fix', '{"tags":["bug"],"status":["open","pending"]}', 'private')`, [admin.id]
-  );
-  await query(
-    `INSERT INTO notifications (user_id, type, title, body, link) VALUES
-     ($1, 'ticket_assigned', 'Ticket #${ticketIds[2]} assigned to you', 'API returns 500 on /v2/orders', '/tickets/${ticketIds[2]}'),
-     ($1, 'sla_breach', 'Resolution overdue on #${ticketIds[0]}', 'Cannot log in after password reset', '/tickets/${ticketIds[0]}'),
-     ($1, 'csat', 'Jane Customer rated ticket #${ticketIds[29]}: 5/5', 'Great support, thank you!', '/tickets/${ticketIds[29]}')`, [admin.id]
-  );
+  await db.insertMany('ticket_watchers', [{ ticket_id: ticketIds[2], user_id: admin.id }, { ticket_id: ticketIds[12], user_id: admin.id }]);
+  await db.insertMany('saved_views', [
+    { user_id: admin.id, name: 'Urgent & high priority', filters: { priority: ['urgent', 'high'], status: ['open', 'pending'] }, visibility: 'all_agents' },
+    { user_id: admin.id, name: 'Billing queue', filters: { group_id: [billing.id], status: ['open', 'pending'] }, visibility: 'all_agents' },
+    { user_id: admin.id, name: 'Bugs awaiting fix', filters: { tags: ['bug'], status: ['open', 'pending'] }, visibility: 'private' },
+  ]);
+  await db.insertMany('notifications', [
+    { user_id: admin.id, type: 'ticket_assigned', title: `Ticket #${ticketIds[2]} assigned to you`, body: 'API returns 500 on /v2/orders', link: `/tickets/${ticketIds[2]}` },
+    { user_id: admin.id, type: 'sla_breach', title: `Resolution overdue on #${ticketIds[0]}`, body: 'Cannot log in after password reset', link: `/tickets/${ticketIds[0]}` },
+    { user_id: admin.id, type: 'csat', title: `Jane Customer rated ticket #${ticketIds[29]}: 5/5`, body: 'Great support, thank you!', link: `/tickets/${ticketIds[29]}` },
+  ]);
 
   console.log(`Seeded ${agents.length} agents, ${groups.length} groups, ${companies.length} companies, ${contacts.length} contacts, ${subjects.length} tickets.`);
   console.log('Agent login:    admin@supportdesk.local / password123  (admin)');
   console.log('Agent login:    priya@supportdesk.local / password123  (agent)');
   console.log('Customer login: customer@acme.com / password123        (portal)');
-  await pool.end();
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });

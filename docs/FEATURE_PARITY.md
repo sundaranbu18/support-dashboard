@@ -1,13 +1,13 @@
 # Help desk feature parity
 
-Checklist of the Freshdesk screens reviewed, and where each stands in SupportDesk.
+Checklist of the Freshdesk screens reviewed, and where each stands in Nexus.
 Freshdesk was only viewed. No customer data was copied.
 
 **Status:** Done = works end to end. Bridge = works, but needs an outside provider connected. Not built = missing.
 
 ## Tickets
 
-| Freshdesk | SupportDesk | Status |
+| Freshdesk | Nexus | Status |
 | --- | --- | --- |
 | Personal, shared and default views, view search | `/tickets` | Done |
 | Raised by me, mentioned in, watching, archive, spam, trash | `/tickets` | Done |
@@ -31,7 +31,7 @@ Freshdesk was only viewed. No customer data was copied.
 
 ## Other areas
 
-| Freshdesk | SupportDesk | Status |
+| Freshdesk | Nexus | Status |
 | --- | --- | --- |
 | My Dashboard: tiles, today's trends, filters | `/dashboard` | Done |
 | Contacts and companies: import, export, custom fields | `/contacts`, `/companies` | Done |
@@ -44,7 +44,7 @@ Freshdesk was only viewed. No customer data was copied.
 
 ## Admin
 
-| Freshdesk | SupportDesk | Status |
+| Freshdesk | Nexus | Status |
 | --- | --- | --- |
 | Agents, groups, business hours, SLA, tags, canned responses | Admin | Done (already existed) |
 | Roles with enforced privileges | Admin, Roles | Done |
@@ -72,10 +72,10 @@ Freshdesk was only viewed. No customer data was copied.
 
 ## Setup
 
-Apply new tables without touching existing data:
+Push the Convex schema and functions (adds new tables without touching existing data):
 
 ```bash
-npm --prefix backend run db:migrate
+npm run convex:push
 ```
 
 Add sample data for the new features:
